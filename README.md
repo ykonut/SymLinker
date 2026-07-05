@@ -2,6 +2,8 @@
 
 A lightweight macOS GUI tool for creating symbolic links via drag & drop.
 
+[中文](README.zh.md)
+
 ## Features
 
 - **Drag & drop** files from Finder into the source list
