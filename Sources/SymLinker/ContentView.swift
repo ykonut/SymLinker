@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import UniformTypeIdentifiers
 
 // MARK: - Main Content View
@@ -13,6 +14,10 @@ struct ContentView: View {
     @State private var isSourceDropTargeted: Bool = false
     @State private var isTargetDropTargeted: Bool = false
     @State private var targetDirValidationMessage: String = ""
+    @State private var isEditingTargetPath: Bool = false
+    @State private var targetPathDraft: String = ""
+    @State private var lastCreationResults: [SymLinkResult] = []
+    @State private var canUndo: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,6 +29,9 @@ struct ContentView: View {
         }
         .frame(minWidth: 400, minHeight: 460)
         .background(Color(NSColor.windowBackgroundColor))
+        .sheet(isPresented: $isEditingTargetPath) {
+            targetPathEditorSheet
+        }
     }
 
 
@@ -165,11 +173,31 @@ struct ContentView: View {
                         .foregroundColor(.secondary.opacity(0.4))
                 }
 
-                TextField(targetDirectory == nil ? "/path/to/destination" : "",
-                          text: $targetPathText)
-                    .textFieldStyle(.plain)
+                // The path is shown as plain (non-editable) text so the row can
+                // act as a drop target. A native NSTextField uses a shared field
+                // editor that accepts file drops and inserts the folder path as
+                // text, which is exactly the behaviour we want to avoid. Typing
+                // is available by clicking the text (opens a small editor sheet).
+                Button {
+                    beginEditingTargetPath()
+                } label: {
+                    Group {
+                        if targetPathText.isEmpty {
+                            Text("/path/to/destination")
+                                .foregroundColor(.secondary.opacity(0.5))
+                        } else {
+                            Text(targetPathText)
+                                .foregroundColor(.primary)
+                        }
+                    }
                     .font(.body.monospaced())
-                    .onSubmit { commitTargetPath() }
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Click to edit the path")
 
                 if !targetPathText.isEmpty {
                     Button {
@@ -256,11 +284,24 @@ struct ContentView: View {
                         .font(.callout)
                         .foregroundColor(.secondary)
                     Spacer()
+                    if canUndo {
+                        Button {
+                            undoLastCreation()
+                        } label: {
+                            Label("Undo", systemImage: "arrow.uturn.backward")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(isCreating)
+                        .help("Remove the symbolic links that were just created")
+                    }
                     if !statusIsError {
                         Button("Clear") {
                             sourceFiles.removeAll()
                             clearTargetDirectory()
                             statusMessage = ""
+                            lastCreationResults = []
+                            canUndo = false
                         }
                         .buttonStyle(.plain)
                         .font(.subheadline)
@@ -302,12 +343,49 @@ struct ContentView: View {
         setTargetDirectory(url)
     }
 
-    private func commitTargetPath() {
-        let trimmed = targetPathText.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func beginEditingTargetPath() {
+        targetPathDraft = targetPathText
+        isEditingTargetPath = true
+    }
+
+    private func applyTargetPathDraft() {
+        let trimmed = targetPathDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        isEditingTargetPath = false
         guard !trimmed.isEmpty else { return }
 
         let url = URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
         setTargetDirectory(url)
+    }
+
+    private var targetPathEditorSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Set Target Directory")
+                .font(.headline)
+            Text("Enter the path of the folder where symbolic links should be created.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            TextField("/path/to/destination", text: $targetPathDraft)
+                .textFieldStyle(.roundedBorder)
+                .font(.body.monospaced())
+                .frame(width: 440)
+                .onSubmit { applyTargetPathDraft() }
+
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    isEditingTargetPath = false
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Button("Save") {
+                    applyTargetPathDraft()
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
     }
 
     private func setTargetDirectory(_ url: URL) {
@@ -372,8 +450,9 @@ struct ContentView: View {
     }
 
     private func handleTargetDrop(providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first,
-              provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) else {
+        guard let provider = providers.first(where: {
+            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        }) else {
             return false
         }
 
@@ -390,9 +469,20 @@ struct ContentView: View {
                 return nil
             }()
 
-            if let url = url {
-                DispatchQueue.main.async {
-                    setTargetDirectory(url)
+            guard let url = url else { return }
+
+            let resolved = url.standardizedFileURL
+            DispatchQueue.main.async {
+                var isDir: ObjCBool = false
+                let exists = FileManager.default.fileExists(
+                    atPath: resolved.path,
+                    isDirectory: &isDir
+                )
+                if exists && isDir.boolValue {
+                    setTargetDirectory(resolved)
+                } else {
+                    targetDirValidationMessage =
+                        "Please drop a folder to use as the target directory."
                 }
             }
         }
@@ -408,6 +498,8 @@ struct ContentView: View {
         isCreating = true
         statusMessage = ""
         statusIsError = false
+        canUndo = false
+        lastCreationResults = []
 
         DispatchQueue.global(qos: .userInitiated).async {
             let result = SymLinkerService.createSymlinks(
@@ -420,22 +512,70 @@ struct ContentView: View {
 
                 let successCount = result.filter(\.isSuccess).count
                 let failCount = result.filter { !$0.isSuccess }.count
+                let replacedCount = result.filter { $0.isSuccess && $0.replacedExistingLink }.count
+
+                // Remember what was created so the user can undo it.
+                lastCreationResults = result.filter(\.isSuccess)
+                canUndo = !lastCreationResults.isEmpty
+
+                let replacedSuffix: String = replacedCount > 0
+                    ? " (replaced \(replacedCount) existing link\(replacedCount == 1 ? "" : "s"))"
+                    : ""
 
                 if failCount == 0 {
-                    statusMessage = "Successfully created \(successCount) symbolic link\(successCount == 1 ? "" : "s")."
+                    statusMessage = "Successfully created \(successCount) symbolic link\(successCount == 1 ? "" : "s")\(replacedSuffix)."
                     statusIsError = false
                 } else if successCount > 0 {
                     let errors = result
                         .filter { !$0.isSuccess }
                         .compactMap { "\($0.file.lastPathComponent): \($0.error ?? "unknown error")" }
                         .joined(separator: "\n")
-                    statusMessage = "Created \(successCount) link\(successCount == 1 ? "" : "s"), \(failCount) failed:\n\(errors)"
+                    statusMessage = "Created \(successCount) link\(successCount == 1 ? "" : "s")\(replacedSuffix), \(failCount) failed:\n\(errors)"
                     statusIsError = true
                 } else {
                     let errors = result
                         .compactMap { "\($0.file.lastPathComponent): \($0.error ?? "unknown error")" }
                         .joined(separator: "\n")
                     statusMessage = "Failed to create symbolic links:\n\(errors)"
+                    statusIsError = true
+                }
+            }
+        }
+    }
+
+    private func undoLastCreation() {
+        guard !lastCreationResults.isEmpty else { return }
+
+        let results = lastCreationResults
+        canUndo = false
+        lastCreationResults = []
+        statusMessage = ""
+        statusIsError = false
+        isCreating = true
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let summary = SymLinkerService.undo(results: results)
+
+            DispatchQueue.main.async {
+                isCreating = false
+
+                var parts: [String] = []
+                if summary.removedNewLinks > 0 {
+                    parts.append("removed \(summary.removedNewLinks) created link\(summary.removedNewLinks == 1 ? "" : "s")")
+                }
+                if summary.restoredLinks > 0 {
+                    parts.append("restored \(summary.restoredLinks) previous link\(summary.restoredLinks == 1 ? "" : "s")")
+                }
+
+                let base = parts.isEmpty
+                    ? "Nothing to undo."
+                    : "Undo complete: " + parts.joined(separator: ", ") + "."
+
+                if summary.errors.isEmpty {
+                    statusMessage = base
+                    statusIsError = false
+                } else {
+                    statusMessage = base + "\n" + summary.errors.joined(separator: "\n")
                     statusIsError = true
                 }
             }
@@ -507,75 +647,3 @@ struct SourceFileRow: View {
     }
 }
 
-// MARK: - Symlink Service
-
-struct SymLinkResult {
-    let file: URL
-    let isSuccess: Bool
-    let error: String?
-}
-
-enum SymLinkerService {
-    static func createSymlinks(files: [URL], targetDir: URL) -> [SymLinkResult] {
-        let fm = FileManager.default
-
-        // Ensure target directory exists
-        var isDir: ObjCBool = false
-        if !fm.fileExists(atPath: targetDir.path, isDirectory: &isDir) {
-            do {
-                try fm.createDirectory(at: targetDir, withIntermediateDirectories: true)
-            } catch {
-                // If we can't create the dir, all results fail
-                return files.map {
-                    SymLinkResult(file: $0, isSuccess: false, error: "Cannot create target directory: \(error.localizedDescription)")
-                }
-            }
-        } else if !isDir.boolValue {
-            return files.map {
-                SymLinkResult(file: $0, isSuccess: false, error: "Target path is not a directory")
-            }
-        }
-
-        return files.map { file in
-            let linkName = file.lastPathComponent
-            let linkPath = targetDir.appendingPathComponent(linkName)
-
-            // Check if target already exists
-            if fm.fileExists(atPath: linkPath.path) {
-                // Try to remove if it's a broken/valid symlink, or ask user
-                // For safety, skip with error
-                return SymLinkResult(
-                    file: file,
-                    isSuccess: false,
-                    error: "\(linkName) already exists in target directory"
-                )
-            }
-
-            // Use POSIX ln -s via Process
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/ln")
-            process.arguments = ["-s", file.path, linkPath.path]
-
-            let stdoutPipe = Pipe()
-            let stderrPipe = Pipe()
-            process.standardOutput = stdoutPipe
-            process.standardError = stderrPipe
-
-            do {
-                try process.run()
-                process.waitUntilExit()
-
-                if process.terminationStatus == 0 {
-                    return SymLinkResult(file: file, isSuccess: true, error: nil)
-                } else {
-                    let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-                    let errMsg = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-                        ?? "Unknown error (exit code \(process.terminationStatus))"
-                    return SymLinkResult(file: file, isSuccess: false, error: errMsg)
-                }
-            } catch {
-                return SymLinkResult(file: file, isSuccess: false, error: error.localizedDescription)
-            }
-        }
-    }
-}
